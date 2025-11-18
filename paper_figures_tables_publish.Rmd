@@ -1,0 +1,785 @@
+---
+title: "CRKP Pairwise Regression Modeling"
+author: "Hannah Steinberg"
+date: '2025-11-18'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+
+
+library(tidyverse)
+library(magrittr)
+library(readxl)
+library(ape)
+library(janitor)
+library(lubridate)
+library(Biostrings)
+library(jtools)
+library(lme4)
+library(lmerTest)
+library(modelr)
+library(brms)
+library(modelsummary)
+library(gtsummary)
+
+
+data_path = ""
+results_path = ""
+```
+
+```{r data}
+#Rows = patients; columns = dates; values: 0 = not present, 1 = present, 1.25 = present, negative swab, 1.5 = present, positive swab
+facility_trace = read_csv(paste0(data_path,"/2019-12-18_facility_trace.csv")) %>% clean_names() %>%
+  dplyr::rename(patient_id = x1)
+
+#Rows = patients; columns = dates; values = floor number
+floor_trace = read_csv(paste0(data_path,"/2019-12-18_floor_trace.csv")) %>% clean_names() %>%
+   dplyr::rename(patient_id = x1)
+
+#Information about each patient/isolate
+patient_isolate_date_lookup = read_csv(paste0(data_path,"/2019-12-18_patient_isolate_date_lookup_df.csv")) %>%
+  clean_names() %>%
+  mutate(isolate = paste0("Rush_KPC_", isolate_id),
+         across(contains("_da"), as.Date, origin = "1970-01-01")
+         )
+
+#Rows = patients; columns = dates; values = room number  
+room_trace = read_csv(paste0(data_path,"/2019-12-18_room_trace.csv"))%>% clean_names() %>%
+   dplyr::rename(patient_id = x1)
+
+#Columns: patient ID, antibiotic name, start date, stop date
+antibiotics = read_xlsx(paste0(data_path,"/2020-02-25_antibiotics.xlsx")) %>%
+    mutate(StartDate = as.Date(StartDate, origin = "1899-12-31"),
+           StopDate = as.Date(StopDate, origin = "1899-12-31"))
+
+#Columns: isolate ID, cluster ID
+clusters = read_xlsx(paste0(data_path,"/2021-01-26_cluster_isolate_summary_table.xlsx")) %>%
+  clean_names() %>%
+  select(isolate_id, cluster_id) %>%
+  mutate(isolate_id = paste0("Rush_KPC_", isolate_id))
+
+#Information about clinical CRKP infections outside of colonization study
+clinical = read_xlsx(paste0(data_path, "/KPCLTACH_C_ClinicalMicro-2.xlsx")) %>%
+  clean_names() 
+
+```
+
+
+
+
+```{r genomes}
+#Gubbins filtered core genome fasta alignment for st258 isolates
+dna_path = ""
+dna = readDNAStringSet(dna_path)
+
+#poor quality genomes
+to_filter = c() #list suppressed
+to_filter_long_name = paste0("Rush_KPC_", to_filter)
+
+#clean names
+names(dna) = gsub("_S\\d+$", "", names(dna))
+
+#take out reference genomes and filtered genomes
+dna = dna[-c(1,2)]
+filter_index = which(names(dna) %in% to_filter_long_name)
+dna = dna[-c(filter_index)]
+
+#Calculate SNV distances
+dna_dist = dist.dna(as.DNAbin(dna), model="N") %>% #N = substitutions between two sequences of equal length
+  as.matrix()
+
+#pairwise distances st258 samples- transforms matrix into a data frame with a row for each pair
+snps_pairwise = expand.grid(names(dna), names(dna)) %>%
+  rowwise() %>%
+  mutate(pairwise_snp_dif = dna_dist[Var1, Var2]) %>%
+  dplyr::rename(sequence_1 = Var1, sequence_2 = Var2) %>%
+  left_join(patient_isolate_date_lookup %>% select(isolate, patient_id), by = c("sequence_1" = "isolate")) %>%
+  dplyr::rename(pt_1 = patient_id) %>%
+  left_join(patient_isolate_date_lookup %>% select(isolate, patient_id), by = c("sequence_2" = "isolate")) %>%
+  dplyr::rename(pt_2 = patient_id) %>%
+  filter(sequence_1 != sequence_2)
+
+#add culture dates to pairwise data and keep just one pair per set of isolates based on who tested positive first
+snps_pairwise_with_culture_dates = snps_pairwise %>%
+  filter(!is.na(pt_2) & !is.na(pt_1)) %>%
+  left_join(patient_isolate_date_lookup %>% select(isolate, culture_date, last_isolate_neg_date, mlst, index_isolate), by = c("sequence_1" = "isolate")) %>%
+  dplyr::rename(culture_date_1 = culture_date, last_isolate_neg_date_1 = last_isolate_neg_date, mlst_1 = mlst, index_isolate_1 = index_isolate) %>%
+  left_join(patient_isolate_date_lookup %>% select(isolate, culture_date, last_isolate_neg_date, mlst, index_isolate), by = c("sequence_2" = "isolate")) %>%
+  dplyr::rename(culture_date_2 = culture_date, last_isolate_neg_date_2 = last_isolate_neg_date, mlst_2 = mlst, index_isolate_2 = index_isolate) %>%
+  filter(pt_1 != pt_2) %>%
+  #just keep one row per pair of isolates
+  mutate(keep = case_when(culture_date_1 < culture_date_2 ~ TRUE,
+                          culture_date_1 == culture_date_2 & 
+                            last_isolate_neg_date_1 < last_isolate_neg_date_2 ~ TRUE,
+                          culture_date_1 == culture_date_2 &
+                            last_isolate_neg_date_1 == last_isolate_neg_date_2 &
+                            pt_1 < pt_2 ~ TRUE,
+                          TRUE ~ FALSE
+                          )) %>%
+  filter(keep) %>%
+  select(-keep)
+
+
+```
+
+```{r facility_days}
+
+#create list of days in facility for each patient
+facility_days = facility_trace %>%
+  mutate(across(starts_with("x"), ~ifelse(.x > 0, 1, NA))) %>%
+  pivot_longer(!patient_id, names_to = "date", values_to = "facility") %>%
+  group_by(patient_id) %>%
+  summarise(facility = list(facility)) 
+
+#create list of floor by day for each patient
+floor_days = floor_trace %>%
+  mutate(across(starts_with("x"), ~ifelse(.x == 0, NA, .x))) %>%
+  pivot_longer(!patient_id, names_to = "date", values_to = "floor") %>%
+  group_by(patient_id) %>%
+  summarise(floors = list(floor)) 
+
+#create list of room by day for each patient
+room_days = room_trace %>%
+  mutate(across(starts_with("x"), ~ifelse(.x == 0, NA, .x))) %>%
+  pivot_longer(!patient_id, names_to = "date", values_to = "room") %>%
+  group_by(patient_id) %>%
+  summarise(rooms = list(room))  
+
+#study dates
+dates = 15509:15875
+
+#combine facility, floor, and room data
+locations = facility_days %>%
+  left_join(floor_days, by = "patient_id") %>%
+  left_join(room_days, by = "patient_id")
+
+```
+
+```{r add_dates_to_dataset}
+#add location data to pairwise data, calculate pairwise transmission period and location overlap, keep just one pair per set of patients based on which isolates are most closely related
+pairwise_with_dates = snps_pairwise_with_culture_dates %>%
+  ungroup() %>%
+  group_by(sequence_1, sequence_2) %>%
+  left_join(locations, by = c("pt_1" = "patient_id")) %>%
+  dplyr::rename(facility_trace_1 = facility, floor_trace_1 = floors, room_trace_1 = rooms)%>%
+  left_join(locations, by = c("pt_2" = "patient_id")) %>%
+  dplyr::rename(facility_trace_2 = facility, floor_trace_2 = floors, room_trace_2 = rooms) %>%
+  mutate(across(contains("date"), as.numeric),
+         across(contains("date"), ~(.x - min(dates) + 1)), #transform dates into indices
+         ) %>%
+  filter(!(culture_date_1 == 1 & culture_date_2 == 1),#get rid of pairs both admission positive
+         !(culture_date_2 == last_isolate_neg_date_2), #get rid of 2nd pt zero exposure time
+         !(index_isolate_2), #get rid of 2nd pt pos on admission
+         !((culture_date_1 > length(dates)) | (culture_date_2 > length(dates))) # get rid of culture dates after location data no longer available
+         ) %>%
+  mutate(trans_period = list(max(last_isolate_neg_date_1, last_isolate_neg_date_2):culture_date_2),
+         trans_period_l = length(unlist(trans_period)),
+         across(contains("trace"), ~list(.x[[1]][trans_period[[1]]])),
+         shared_facility_days = length(which(unlist(facility_trace_1)==unlist(facility_trace_2))),
+         shared_floor_days = length(which(unlist(floor_trace_1)==unlist(floor_trace_2))),
+         shared_room_days = length(which(unlist(room_trace_1)==unlist(room_trace_2))),
+         shared_floor = shared_floor_days > 0,
+         shared_room = shared_room_days > 0,
+         shared_floor_last_day = last(which(unlist(floor_trace_1)==unlist(floor_trace_2))),
+         shared_floor_number = unlist(floor_trace_1)[shared_floor_last_day],
+         shared_floor_number = replace_na(shared_floor_number, 0),
+         shared_floor_number = factor(shared_floor_number, levels = c(0,6,3,1,2,4),
+                                      labels = c("none", "A", "B", "C", "D", "E")),
+         culture_date_dif = (culture_date_2 - culture_date_1)/30,
+         period = base::cut(culture_date_2, breaks = quantile(0:length(dates)), label = F)
+         ) %>%
+  filter(shared_facility_days > 0) %>%
+  ungroup() %>%
+  group_by(pt_1, pt_2) %>% #get closest isolate per patient pair, exclude others
+  arrange(pairwise_snp_dif, .by_group = TRUE) %>%
+  slice_head(n=1)
+
+
+```
+
+```{r antibiotics}
+#transofrm antibiotic data
+abx_dates = antibiotics %>%
+  clean_names() %>%
+  rowwise() %>%
+  mutate(start_date_numeric = floor(as.numeric(start_date))-min(dates)+1,
+         stop_date_numeric = floor(as.numeric(stop_date))-min(dates)+1
+         ) %>%
+  filter(stop_date_numeric > 0,
+         start_date_numeric <= length(dates)
+         ) %>%
+  mutate(abx_dates = list(start_date_numeric:stop_date_numeric))
+
+#filter just carbapenems
+pt_carb_dates = abx_dates %>%
+  filter(grepl("penem", medication)) %>%
+  group_by(patient_id) %>%
+  dplyr::summarise(abx_carb = list(abx_dates)) %>%
+  rowwise() %>%
+  mutate(abx_carb = list(sort(unique(unlist(abx_carb)))))
+
+#filter non-carbapenems
+pt_non_carb_dates = abx_dates %>%
+  filter(!grepl("penem", medication)) %>%
+  group_by(patient_id) %>%
+  dplyr::summarise(abx_non_carb = list(abx_dates)) %>%
+  rowwise() %>%
+  mutate(abx_non_carb = list(sort(unique(unlist(abx_non_carb)))))
+
+
+#get dates per patient when on each type of antibiotic
+pt_abx_dates = abx_dates %>%
+  group_by(patient_id) %>%
+  dplyr::summarise(abx_any = list(abx_dates)) %>%
+  rowwise() %>%
+  mutate(abx_any = list(sort(unique(unlist(abx_any))))) %>%
+  left_join(pt_carb_dates, by = "patient_id") %>%
+  left_join(pt_non_carb_dates, by = "patient_id") 
+
+
+#add to pairwise dataset
+pairwise = pairwise_with_dates %>%
+  left_join(pt_abx_dates, by = c("pt_1" = "patient_id")) %>%
+  rename_with(~str_c(., "_1"), contains("abx")) %>%
+  left_join(pt_abx_dates, by = c("pt_2" = "patient_id")) %>%
+  rename_with(~str_c(., "_2"), contains("abx")) %>%
+  rename_with(~gsub("_1_2", "_1", .), contains("abx")) %>%
+  mutate(across(contains("abx"), ~list(intersect(unlist(.x), unlist(trans_period)))),
+         across(contains("abx"), ~length(unlist(.x))>0)
+         )
+
+
+```
+
+```{r regression_snv}
+
+#Model 1- log-linear regression on pairwise SNV distance + 1
+snv_model = lmer(log(pairwise_snp_dif+1) ~  shared_floor + shared_room +  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise)
+summary(snv_model)
+
+
+#include individual floor numbers
+snv_model_floor_num = lmer(log(pairwise_snp_dif+1) ~  shared_floor_number + shared_room +  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise)
+summary(snv_model_floor_num)
+```
+
+
+
+
+
+```{r top_regression}
+#Model 2- logistic model on whether closest donor for recipient
+
+#calculate who closest donor for each recipient is
+pairwise_top = pairwise %>%
+  group_by(pt_2) %>%
+  arrange(pt_2, pairwise_snp_dif) %>%
+  mutate(min_snp_distance = min(pairwise_snp_dif),
+         min_distance = as.numeric(pairwise_snp_dif == min_snp_distance)
+         )
+
+#Model with shared floor in general
+top_model = glmer(min_distance ~ shared_floor + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise_top, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+    nAGQ = 10)
+
+summ(top_model, exp = T)
+
+#Model with individual floor numbers
+top_model_floor_num = glmer(min_distance ~ shared_floor_number + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise_top, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+    nAGQ = 10)
+
+
+```
+
+```{r clusters_regression}
+#Model 3- logisitic regression with whether isolates are in the same genomic cluster
+
+#add cluster information to data
+pairwise_clusters = pairwise %>%
+  left_join(clusters, by = c("sequence_1" = "isolate_id")) %>%
+  dplyr::rename(cluster_1 = cluster_id) %>%
+  left_join(clusters, by = c("sequence_2" = "isolate_id")) %>%
+  dplyr::rename(cluster_2 = cluster_id) %>%
+  mutate(same_cluster = !is.na(cluster_1) & !is.na(cluster_2) & cluster_1 == cluster_2)
+
+#min/max cluster sizes
+study_clusters = clusters %>% filter(isolate_id %in% pairwise_clusters$sequence_1 |
+                                       isolate_id %in% pairwise_clusters$sequence_2)
+study_clusters_full = clusters %>% filter(cluster_id %in% study_clusters$cluster_id)
+study_clusters_full %>% group_by(cluster_id) %>% count() %>% pull(n) %>% range()
+
+
+#Cluster model with shared floor in general
+cluster_model = glmer(same_cluster ~ shared_floor + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise_clusters, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+    nAGQ = 10)
+
+summ(cluster_model, exp = T)
+
+#Cluster model with individual floor numbers
+cluster_model_floor_num = glmer(same_cluster ~ shared_floor_number + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise_clusters, family = binomial, control = glmerControl(optimizer = "bobyqa"),
+    nAGQ = 10)
+```
+
+```{r summarize_regressions}
+
+#summarize regression results
+
+summ(cluster_model, exp = T)
+summ(top_model, exp = T)
+summ(snv_model, exp = T)
+
+
+AIC(cluster_model)
+AIC(top_model)
+AIC(snv_model)
+
+#Models with floor as one variable
+models = list("SNV Distance Model" = snv_model, "Closest Donor Model" = top_model, "Same Cluster Model" = cluster_model)
+sup_tab_1 = modelsummary(models, estimate = "{estimate} ({conf.low}, {conf.high})", statistic = NULL, exponentiate = T, fmt = fmt_decimal(digits = 2), output = "data.frame")
+
+sup_tab_1
+
+write_csv(sup_tab_1, file = paste0(results_path, "/model_output_floor_one_var.csv"))
+
+#Models with floors individual variables
+models_floor_num = list("SNV Distance Model" = snv_model_floor_num, "Closest Donor Model" = top_model_floor_num, "Same Cluster Model" = cluster_model_floor_num)
+tab_2 = modelsummary(models_floor_num, estimate = "{estimate} ({conf.low}, {conf.high})", statistic = NULL, exponentiate = T, fmt = fmt_decimal(digits = 2), output = "data.frame")
+
+tab_2
+
+write_csv(tab_2, file = paste0(results_path, "/model_output_floor_own_vars.csv"))
+
+
+
+```
+
+```{r combine_export_data}
+#Join all model outcomes in one dataset
+pairwise_all_outcomes = pairwise %>%
+  left_join(pairwise_clusters %>% select(pt_1, pt_2, cluster_1, cluster_2, same_cluster), 
+            by = c("pt_1", "pt_2")) %>%
+  left_join(pairwise_top %>% select(pt_1, pt_2, min_snp_distance, min_distance),
+            by = c("pt_1", "pt_2")) %>%
+  dplyr::rename(closest_donor = min_distance) %>%
+  select(-c(contains("trace"), "trans_period"))
+
+```
+
+
+```{r figure_1_snv_dist_histogram}
+#Make Figure 1- SNV distances histogram
+
+#snv distances by category
+snp_dists = pairwise_with_dates %>% 
+  select(pt_1, pt_2, pairwise_snp_dif) %>%
+  dplyr::rename(`Possible Pairs` = pairwise_snp_dif) %>%
+  left_join(pairwise_top %>% filter(min_distance == 1) %>% select(pt_1, pt_2, pairwise_snp_dif), by = c("pt_1", "pt_2")) %>%
+  dplyr::rename(`Closest Donor` = pairwise_snp_dif) %>%
+  left_join(pairwise_clusters %>% filter(same_cluster) %>% select(pt_1, pt_2, pairwise_snp_dif), by = c("pt_1", "pt_2")) %>%
+  dplyr::rename(`Same Cluster` = pairwise_snp_dif) %>%
+  pivot_longer(-c(pt_1,pt_2), names_to = "set",values_to = "SNV Distance") %>%
+  filter(!is.na(`SNV Distance`)) %>%
+  mutate(set = factor(set, levels = c("All Pairs", "Possible Pairs", "Closest Donor","Same Cluster")),
+         `Log(SNV Distance)` = log(`SNV Distance`)
+         )
+
+#Figure 1
+snv_dist_hists = ggplot(data = snp_dists) +
+  geom_histogram(aes(`SNV Distance`), bins = 50, fill = "grey40") +
+  facet_grid(vars(set), scales = "free_y") +
+  theme_minimal() +
+  labs(y = "Number of Pairs") 
+
+snv_dist_hists
+
+pdf(paste0(results_path, "/snv_dist_hists.pdf"), width = 6, height = 4)
+snv_dist_hists
+dev.off()
+
+
+
+
+```
+```{r IQRs_fig1}
+#all pairs
+#summary(pairwise$pairwise_snp_dif)
+
+#possible pairs
+summary(pairwise$pairwise_snp_dif)
+
+#closest donor
+summary(pairwise_top %>% ungroup() %>% filter(min_distance ==1) %>% pull(pairwise_snp_dif))
+
+#same cluster
+summary(pairwise_clusters %>% ungroup() %>% filter(same_cluster) %>% pull(pairwise_snp_dif))
+
+```
+
+
+
+
+```{r only_infection_and_admit_testing}
+#Sensitivity analysis only including patients that were positive on admission or who had a clinical CRKP infection during the study period
+
+#all patient IDs
+ids = unique(c(pairwise$pt_1, pairwise$pt_2))
+
+#patients with clinical CRKP infection
+kpc_infections = clinical %>%
+  filter(org == "Klebsiella pneumoniae",
+         carbapenem_r == 1
+         )
+
+kpc_infections_pts = unique(kpc_infections$wgs_study_id)
+
+#which of most likely donor/recipeint pairs are in new data
+top_infectors = pairwise_top %>%
+  filter(min_distance == 1) %>%
+  mutate(pt_1_infection = pt_1 %in% kpc_infections_pts,
+         pt_2_infection = pt_2 %in% kpc_infections_pts,
+         both_infected = pt_1_infection + pt_2_infection == 2,
+         both_infected_or_index = (pt_1_infection|index_isolate_1) & (pt_2_infection|index_isolate_2)
+         )
+
+length(which(ids %in% kpc_infections_pts))/length(ids) #% have infection
+table(top_infectors$both_infected)/nrow(top_infectors) #% of top pairs both have infection, would be identified
+table(top_infectors$both_infected_or_index)/nrow(top_infectors) #% of top pairs both patients were either infected or index pos, would be identified
+table(top_infectors$both_infected)/nrow(top_infectors) #% of top pairs both patients were infected
+patient_isolate_date_lookup %>% filter(mlst == 258) %>% group_by(patient_id) %>% arrange(culture_date) %>% slice_head(n=1) %>% pull(index_isolate) %>% table() #% positive on admission
+pos_admit_ids = patient_isolate_date_lookup %>% filter(mlst == 258) %>% group_by(patient_id) %>% arrange(culture_date) %>% slice_head(n=1) %>% pull(patient_id)
+length(intersect(kpc_infections_pts, pos_admit_ids)) #number of patients both pos on admission and infected
+
+
+#data for only infected or admit positive
+pairwise_sensitivity = pairwise %>%
+  filter((pt_1 %in% kpc_infections_pts|index_isolate_1) &
+          (pt_2 %in% kpc_infections_pts|index_isolate_2)        
+  )
+
+pairwise_clusters_sensitivity = pairwise_clusters %>%
+    filter((pt_1 %in% kpc_infections_pts|index_isolate_1) &
+          (pt_2 %in% kpc_infections_pts|index_isolate_2)        
+  )
+
+length(unique(c(pairwise_sensitivity$pt_1, pairwise_sensitivity$pt_2))) #individuals in sensitivity analysis
+nrow(pairwise_sensitivity) #pairs in sensitivity analysis
+
+
+#snp model
+snv_model_sensitivity = lmer(log(pairwise_snp_dif+1) ~  shared_floor + shared_room +  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise_sensitivity)
+
+summ(snv_model_sensitivity, confint = getOption("summ-confint", TRUE), exp = T)
+
+summ(lmer(log(pairwise_snp_dif+1) ~  shared_floor_number + shared_room +  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), data = pairwise_sensitivity), confint = getOption("summ-confint", TRUE), exp = T)
+
+
+     
+#cluster model 
+cluster_model_sensitivity = glmer(same_cluster ~ shared_floor + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), 
+      data = pairwise_clusters_sensitivity, 
+      family = binomial, control = glmerControl(optimizer = "bobyqa"),
+    nAGQ = 100)
+
+summ(cluster_model_sensitivity, confint = getOption("summ-confint", TRUE), exp = T, 
+    digits = getOption("jtools-digits", default = 4)
+    )
+
+summ(glmer(same_cluster ~ shared_floor_number + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), 
+      data = pairwise_clusters_sensitivity, 
+      family = binomial, control = glmerControl(optimizer = "nloptwrap"),
+    nAGQ = 100), confint = getOption("summ-confint", TRUE), exp = T)
+
+#top model 
+pairwise_top_sensitivity = pairwise_sensitivity %>%
+  group_by(pt_2) %>%
+  arrange(pt_2, pairwise_snp_dif) %>%
+  mutate(min_snp_distance = min(pairwise_snp_dif),
+         min_distance = as.numeric(pairwise_snp_dif == min_snp_distance)
+         )
+
+top_model_sensitivity = glmer(min_distance ~ shared_floor + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), 
+      data = pairwise_top_sensitivity, 
+      family = binomial, control = glmerControl(optimizer = "bobyqa"),
+    nAGQ = 10)
+  
+summ(top_model_sensitivity, confint = getOption("summ-confint", TRUE), exp = T)
+
+summ(glmer(min_distance ~ shared_floor_number + shared_room+  culture_date_dif + abx_carb_1 + abx_non_carb_1 + as.factor(period) + (1 | pt_1), 
+      data = pairwise_top_sensitivity, 
+      family = binomial, control = glmerControl(optimizer = "bobyqa"),
+    nAGQ = 10), confint = getOption("summ-confint", TRUE), exp = T)
+
+
+#Aggregate models
+models_sensitivity = list("SNV Distance Model" = snv_model_sensitivity, "Closest Donor Model" = top_model_sensitivity, "Same Cluster Model" = cluster_model_sensitivity)
+sup_tab_2 = modelsummary(models_sensitivity, estimate = "{estimate} ({conf.low}, {conf.high})", statistic = NULL, exponentiate = T, fmt = fmt_decimal(digits = 2), output = "data.frame")
+
+sup_tab_2
+
+write_csv(sup_tab_2, file = paste0(results_path, "/model_output_only_infection_admit_pos.csv"))
+
+
+#counts
+index_258_isolates = patient_isolate_date_lookup %>%
+  filter(index_isolate,
+         mlst == 258
+         ) %>%
+  pull(patient_id) %>%
+  unique()
+
+infection_258_isolates = patient_isolate_date_lookup %>%
+  filter(patient_id %in% kpc_infections$wgs_study_id,
+         mlst == 258
+         ) %>%
+  pull(patient_id) %>%
+  unique()
+
+index_and_infection_258 = intersect(index_258_isolates, infection_258_isolates)
+
+index_or_infection_258 = unique(c(index_258_isolates, infection_258_isolates))
+
+neither_index_nor_infection_258 = patient_isolate_date_lookup %>%
+  filter(!(patient_id %in% c(infection_258_isolates, index_258_isolates)),
+         mlst == 258)%>%
+  pull(patient_id) %>%
+  unique()
+
+length(index_258_isolates) 
+length(infection_258_isolates) 
+length(index_and_infection_258) 
+length(neither_index_nor_infection_258) 
+length(index_or_infection_258) 
+
+#number of closest donor pairs missed without screening
+pairwise_top %>%
+  mutate(keep = (pt_1 %in% infection_258_isolates|index_isolate_1) &
+           (pt_2 %in% infection_258_isolates|index_isolate_2)) %>%
+  pull(keep) %>%
+  table()/nrow(pairwise_top)
+
+```
+
+
+
+
+
+```{r figure_2_cluster_sharing_by_floor_room_sharing}
+#% in same cluster if shared room
+room_sharing_same_cluster = pairwise_clusters %>%
+  group_by(shared_room) %>%
+  summarise(n = n(),
+            n_same_cluster = sum(same_cluster),
+            p_same_cluster = n_same_cluster/n,
+            l_ci = binom.test(n_same_cluster, n)$conf.int[1],
+            u_ci = binom.test(n_same_cluster, n)$conf.int[2]
+            )
+
+#% closest donor if shared room
+room_sharing_closest = pairwise_top %>%
+  group_by(shared_room) %>%
+  summarise(n = n(),
+            n_top = sum(min_distance),
+            p_top = n_top/n,
+            l_ci = binom.test(n_top, n)$conf.int[1],
+            u_ci = binom.test(n_top, n)$conf.int[2]
+            )
+
+
+#% in same cluster if shared floor
+floor_sharing_same_cluster = pairwise_clusters %>%
+  group_by(shared_floor) %>%
+  summarise(n = n(),
+            n_same_cluster = sum(same_cluster),
+            p_same_cluster = n_same_cluster/n,
+            l_ci = binom.test(n_same_cluster, n)$conf.int[1],
+            u_ci = binom.test(n_same_cluster, n)$conf.int[2]
+            )
+#% closest donor if shared floor
+floor_sharing_closest = pairwise_top %>%
+  group_by(shared_floor) %>%
+  summarise(n = n(),
+            n_top = sum(min_distance),
+            p_top = n_top/n,
+            l_ci = binom.test(n_top, n)$conf.int[1],
+            u_ci = binom.test(n_top, n)$conf.int[2]
+            ) %>%
+  mutate(sharing = ifelse(shared_floor, "Shared Floor", "Different Floor"))
+
+#combine room and floor analysis, floor only if dif room
+floor_room_sharing_closest = pairwise_top %>%
+  mutate(sharing = case_when(shared_room ~ "Shared Room",
+                             shared_floor ~ "Shared Floor",
+                             TRUE ~ "Different Floor"
+                             )) %>%
+  group_by(sharing) %>%
+  summarise(n = n(),
+            n_top = sum(min_distance),
+            p_top = n_top/n,
+            l_ci = binom.test(n_top, n)$conf.int[1],
+            u_ci = binom.test(n_top, n)$conf.int[2]
+            ) %>%
+  mutate(label = paste0(sharing, " \n(n=", prettyNum(n, big.mark = ","), ")"))
+
+#clusters
+floor_room_sharing_cluster= pairwise_clusters %>%
+  mutate(sharing = case_when(shared_room ~ "Shared Room",
+                             shared_floor ~ "Shared Floor",
+                             TRUE ~ "Different Floor"
+                             )) %>%
+  group_by(sharing) %>%
+  summarise(n = n(),
+            n_cluster = sum(same_cluster),
+            p_cluster = n_cluster/n,
+            l_ci = binom.test(n_cluster, n)$conf.int[1],
+            u_ci = binom.test(n_cluster, n)$conf.int[2]
+            ) %>%
+  mutate(label = paste0(sharing, " \n(n=", prettyNum(n, big.mark = ","), ")"))
+
+#plots
+closest_sharing_plot = ggplot(floor_room_sharing_closest,  aes(x=label, y=p_top)) +
+  geom_point(stat = "identity", size =2) +
+  geom_errorbar(aes(ymin=l_ci, ymax=u_ci, width = 0.2), linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,0.575)) +
+  theme_minimal() +
+  labs(y="Percent of pairs where donor \nis closest match to recipient",
+       x = "") +
+  theme(text=element_text(size=16))
+
+cluster_sharing_plot = ggplot(floor_room_sharing_cluster,  aes(x=label, y=p_cluster)) +
+  geom_point(stat = "identity", size = 2) +
+  geom_errorbar(aes(ymin=l_ci, ymax=u_ci, width = 0.2), linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0,0.575)) +
+  theme_minimal() +
+  labs(y="Percent of pairs in the same \ngenomic cluster",
+       x = "")+
+  theme(text=element_text(size=16))
+
+#Figure 2
+pdf(paste0(results_path, "/location_relatedness_fig.pdf"), width = 12, height = 5)
+ggpubr::ggarrange(closest_sharing_plot, cluster_sharing_plot, 
+                    labels = c("A", "B"),
+                    ncol = 2, nrow = 1)
+dev.off()
+  
+#percent of closest donors in same cluster
+top_same_cluster = pairwise_top %>%
+    ungroup() %>%
+    select(sequence_1, sequence_2, min_distance) %>%
+    left_join(pairwise_clusters %>% ungroup() %>% select(sequence_1, sequence_2, cluster_1, cluster_2, same_cluster), by = c("sequence_1", "sequence_2")) %>%
+    group_by(min_distance) %>%
+    summarise(n= n(),
+              same_cluster = sum(same_cluster),
+              p_same_cluster = same_cluster/n,
+              l_ci = binom.test(same_cluster, n)$conf.int[1],
+              u_ci = binom.test(same_cluster, n)$conf.int[2]
+              )
+
+```
+
+
+
+```{r table_1}
+#Descriptives table
+
+summary_tbl_1a = tbl_summary(pairwise_all_outcomes, 
+            include = c(pairwise_snp_dif, shared_room, shared_floor, shared_floor_number,
+                        culture_date_dif, abx_any_1, abx_carb_1,abx_non_carb_1, period
+                        ) 
+            )%>% as_tibble() %>% as.data.frame() %>% t() %>% as.data.frame()
+
+summary_tbl_1b = tbl_summary(pairwise_all_outcomes %>% filter(closest_donor == 1), 
+            include = c(pairwise_snp_dif, shared_room, shared_floor, shared_floor_number,
+                        culture_date_dif, abx_any_1, abx_carb_1,abx_non_carb_1, period
+                        )
+            ) %>% as_tibble() %>% as.data.frame() %>% t() %>% as.data.frame()
+
+summary_tbl_1c = tbl_summary(pairwise_all_outcomes %>% filter(same_cluster == 1), 
+            include = c(pairwise_snp_dif, shared_room, shared_floor, shared_floor_number,
+                        culture_date_dif, abx_any_1, abx_carb_1,abx_non_carb_1, period
+                        )
+            ) %>% as_tibble() %>% as.data.frame() %>% t() %>% as.data.frame()
+
+summary_table1 = bind_rows(summary_tbl_1a, summary_tbl_1b) %>%
+  bind_rows(summary_tbl_1c) %>%
+  t() %>%
+  as_tibble() %>%
+  select(-c("**Characteristic**...3", "**Characteristic**...5"))
+  
+  
+summary_groups =   data.frame("group", "Possible Pairs", "Closest Donor Pairs", "Same Cluster Pairs")
+names(summary_groups) = colnames(summary_table1)
+
+ summary_table1%<>%
+  rbind(summary_groups)
+ 
+ write_csv(summary_table1, file = paste0(results_path, "/descriptive_stats.csv"))
+
+```
+
+
+
+
+
+
+```{r sup_fig_1_culture_date_vs_outcome}
+
+#Supplementary Figure 1- testing model assumptions with culture date difference variable- plot each model outcome vs binned culture date difference
+
+#SNV distance
+month_snvs = pairwise_all_outcomes %>%
+  ungroup() %>%
+  mutate(culture_date_dif_month = round(culture_date_dif),
+         culture_date_dif_month = ifelse(culture_date_dif_month > 10, 10, culture_date_dif_month)
+         ) %>%
+  group_by(culture_date_dif_month) %>%
+  summarise(n=n(),
+         mean_snv_dist = mean(pairwise_snp_dif),
+         median_snv_dist = median(pairwise_snp_dif),
+         same_cluster = sum(same_cluster),
+         p_same_cluster = same_cluster/n,
+         closest_donor = sum(closest_donor),
+         p_closest_donor = closest_donor/n
+         )
+
+month_snv = ggplot(month_snvs, aes(x = culture_date_dif_month, y = log(mean_snv_dist))) +
+  geom_point() +
+  theme_minimal() +
+  xlab("Culture date difference (months)") +
+  ylab("Log mean SNV distance") +
+  ylim(c(3,5))+
+  scale_x_continuous(breaks = 0:10) +
+  theme(panel.grid.minor = element_blank()) 
+
+#Same cluster
+month_cluster =ggplot(month_snvs, aes(x = culture_date_dif_month, y = p_same_cluster)) +
+  geom_point() +
+  theme_minimal() +
+  xlab("Culture date difference (months)") +
+  ylab("Percent of pairs in same cluster") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+  scale_x_continuous(breaks = 0:10) +
+  theme(panel.grid.minor = element_blank()) 
+
+#closest potential donor
+month_closest = ggplot(month_snvs, aes(x = culture_date_dif_month, y = p_closest_donor)) +
+  geom_point() +
+  theme_minimal() +
+  xlab("Culture date difference (months)") +
+  ylab("Percent of pairs with closest donor") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits =c(0, .07)) +
+  scale_x_continuous(breaks = 0:10)  +
+  theme(panel.grid.minor = element_blank()) 
+
+
+#save figure
+pdf(paste0(results_path, "/month_and_outcome.pdf"), width = 8, height = 8)
+ggpubr::ggarrange(month_snv, "", month_cluster, month_closest,
+                    labels = c("A", "", "B", "C"),
+                    ncol = 2, nrow = 2)
+dev.off()
+
+```
+
+
